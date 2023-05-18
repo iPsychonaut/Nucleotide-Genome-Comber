@@ -10,10 +10,12 @@ import pandas as pd
 import time
 import os
 import sys
+from Bio.Blast.Applications import NcbiblastnCommandline
 from Bio import SeqIO
 import glob
 import gzip
 import subprocess
+import tempfile
 from tqdm import tqdm
 
 def create_BLAST_db(database_dir):
@@ -80,67 +82,86 @@ def chunk_seq(record, name):
     """Function to divide a sequence into chunks."""
     # Calculate the length of the sequence and the size of each chunk
     length = len(record)
-    chunk_size = int(length/10)
+
+    # If the sequence is shorter than 1000 bases, use the whole sequence for each chunk
+    if length < 1000:
+        return record.seq, record.seq, record.seq
+
+    # Divide the sequence into three parts
+    one_end = int(length/3)
+    start = record.seq[0:one_end]
+    middle = record.seq[one_end:2*one_end]
+    end = record.seq[2*one_end:]
 
     def handle_chunk(chunk):
         """Function to handle a chunk of a sequence."""
-        if len(chunk) > 1000:
-            # If the chunk is longer than 1000 bases, randomly select a 1000 base segment
-            start = random.randint(0, len(chunk) - 1000)  # ensure there's at least 1000 bases left after start
-            return chunk[start:start+1000]  # return exactly 1000 bases
+        if len(chunk) > 2500:
+            # If the chunk is longer than 2500 bases, randomly select a 2500 base segment
+            start = random.randint(0, len(chunk) - 2500)  # ensure there's at least 2500 bases left after start
+            return chunk[start:start+2500]
         else:
             # If the chunk is shorter than 1000 bases, return the whole chunk
             return chunk
 
-    # If the sequence is shorter than 1000 bases, use the whole sequence for each chunk
-    if length < 1000:
-        # print(f'{name}: {length}bp is less than 1000, using the whole contig for BLAST')
-        return handle_chunk(record.seq), handle_chunk(record.seq), handle_chunk(record.seq)
-
-    # If the sequence is too short to be divided into three chunks, raise an error
-    elif length < 3*chunk_size:
-        raise ValueError(f"Contig is too small to be chunked into three parts")
-
-    else:
-        # Otherwise, divide the sequence into three chunks
-        # print(f'{name}: {length}bp into 10x {chunk_size}bp chunks')
-        start = record.seq[2*chunk_size:3*chunk_size]  # 3rd chunk
-        middle = record.seq[5*chunk_size:6*chunk_size]  # 6th chunk
-        end = record.seq[8*chunk_size:9*chunk_size]  # 9th chunk
-        return handle_chunk(start), handle_chunk(middle), handle_chunk(end)
-
-
-def run_local_blast(sequence, database):
-    """Function to run local BLAST with a given sequence against a given database."""
-    # Create the command string
-    cmd = f'echo {sequence} | blastn -db {database} -outfmt 6 -num_alignments 5'
+    # Handle each chunk
+    start = handle_chunk(start)
+    middle = handle_chunk(middle)
+    end = handle_chunk(end)
     
-    # Run the command and capture the output
-    output = subprocess.check_output(cmd, shell=True)
+    return start, middle, end
+
+
+def run_blastn(sequence, db_name):
+    # Create a temporary file and write the sequence to it
+    with tempfile.NamedTemporaryFile(delete=False, mode='w') as temp_file:
+        temp_file.write(f">query\n{sequence}")
+        temp_file_name = temp_file.name
+
+    # Define the blastn command
+    blastn_cline = NcbiblastnCommandline(query=temp_file_name, db=db_name, evalue=0.001, outfmt="6 qseqid sseqid pident qlen qstart qend length gaps", out="blastn_out.txt")
     
-    # Decode the output and extract the percent identity
-    output = output.decode()
-    if len(output) > 0:
-        percent_id = output.split('\t')[2]
-    else:
-        percent_id = 0
-    return percent_id
+    # Run the command
+    stdout, stderr = blastn_cline()
+    
+    # Read the output file into a pandas DataFrame
+    blast_results = pd.read_csv("blastn_out.txt", sep="\t", names=["qseqid", "sseqid", "pident", "qlen", "qstart", "qend", "length", "gaps"])
+    
+    # Clean up the temporary file
+    os.unlink(temp_file_name)
+    
+    # Check if the DataFrame is empty
+    if blast_results.empty:
+        return None, None, None
+        
+    # Pull out data based on column names
+    alignment_length = blast_results['length'].iloc[0]
+    percent_id = blast_results['pident'].iloc[0]
+    query_len = blast_results['qlen'].iloc[0]
+    qstart = blast_results['qstart'].iloc[0]
+    qend = blast_results['qend'].iloc[0]
+    gaps = blast_results['gaps'].iloc[0]
+    
+    # Calculate query coverage
+    percent_qmatch = (alignment_length / query_len) * 100
+
+    return alignment_length, percent_id, percent_qmatch
+    
 
 if __name__ == '__main__':
-    # Check command line arguments
-    if len(sys.argv) != 3:
-        print("Usage: python nucleotide_genome_comber.py DATABASE_DIRECTORY MIXED_GENOME_DIRECTORY")
-        sys.exit(1)
+    # Set the default values
+    DATABASE_DIRECTORY = 'C:/Users/theda/OneDrive/Documents/Python/Entheome/Nucleotide-Genome-Comber/Resources/Oryza_sativa/Nipponbare' # Replace with a folder containing a cds or gbff.gz file to use as search filter
+    MIXED_GENOME_DIRECTORY = 'C:/Users/theda/OneDrive/Documents/Python/Entheome/Nucleotide-Genome-Comber/Resources/E1' # Replace with a folder containing only the fasta file for contigs that need filtering
 
-    # Get the command line arguments
-    DATABASE_DIRECTORY = sys.argv[1]
-    MIXED_GENOME_DIRECTORY = sys.argv[2]
-    
-    if len(DATABASE_DIRECTORY) == 0 and len(MIXED_GENOME_DIRECTORY) == 0:
-        # Use the given directories
-        DATABASE_DIRECTORY = 'C:/Users/theda/OneDrive/Documents/Python/Entheome/Nucleotide-Genome-Comber/Resources/Oryza_sativa/Nipponbare' # Replace with a folder containing a cds or gbff.gz file to use as search filter
-        MIXED_GENOME_DIRECTORY = 'C:/Users/theda/OneDrive/Documents/Python/Entheome/Nucleotide-Genome-Comber/Resources/E1' # Replace with a folder containing only the fasta file for contigs that need filtering
-    
+    # Check command line arguments
+    if len(sys.argv) == 3:
+        # Get the command line arguments if provided
+        DATABASE_DIRECTORY = sys.argv[1]
+        MIXED_GENOME_DIRECTORY = sys.argv[2]
+    else:
+        print("No command line arguments provided, using default directories.")
+        print(f"DATABASE_DIRECTORY: {DATABASE_DIRECTORY}")
+        print(f"MIXED_GENOME_DIRECTORY: {MIXED_GENOME_DIRECTORY}")
+
     #
     # Step 1 Prepare Filter Database
     #    
@@ -157,11 +178,11 @@ if __name__ == '__main__':
     # Step 2 Load Mixed Genome Fasta
     #   
     # Define directory where the mixed genome is located
-     # Change the current working directory to the mixed genome directory
+      # Change the current working directory to the mixed genome directory
     os.chdir(MIXED_GENOME_DIRECTORY)
 
     # Define the columns of the DataFrame
-    columns = ['contig_name', 'start_chunk', 'mid_chunk', 'end_chunk', 'start_percent_id', 'mid_percent_id', 'end_percent_id']
+    columns = ['contig_name', 'start_chunk', 'mid_chunk', 'end_chunk', 'start_percent_id', 'mid_percent_id', 'end_percent_id', 'start_percent_qmatch', 'mid_percent_qmatch', 'end_percent_qmatch', 'start_alignment_length', 'mid_alignment_length', 'end_alignment_length']
 
     # Initialize an empty DataFrame with the specified columns
     df = pd.DataFrame(columns=columns)
@@ -194,7 +215,7 @@ if __name__ == '__main__':
         try:
             start_chunk, mid_chunk, end_chunk = chunk_seq(fasta, name)
             # If successful, add the chunks to the DataFrame
-            df.loc[contig_number] = [name, start_chunk, mid_chunk, end_chunk, None, None, None]
+            df.loc[contig_number] = [name, start_chunk, mid_chunk, end_chunk, None, None, None, None, None, None, None, None, None]
             # Increment the contig number
             contig_number += 1
 
@@ -206,34 +227,42 @@ if __name__ == '__main__':
     df.to_csv(INPUT_FASTA.replace('.fasta','.csv'), index=False)
 
 
-    # 
     # Step 4 Run Local BLAST for each chunk
     # 
     # Start the timer
     start_time = time.time()
 
     # Iterate over each row in the DataFrame and each database
-    for database_dir, csv_suffix, database_cmd in [(DATABASE_DIRECTORY, '_Nipponbare_REMOVED.csv', 'blast_db')]:
+    for database_dir, csv_suffix, database_cmd in [(DATABASE_DIRECTORY, '_blast_REMOVED.csv', 'blast_db')]:
         os.chdir(database_dir)
         for index, row in tqdm(df.iterrows(), total=df.shape[0], desc=f"Running local BLAST on {database_dir.split('/')[-1]}"):
             # For each chunk, run local BLAST and update the percent_id in the DataFrame
             for chunk in ['start_chunk', 'mid_chunk', 'end_chunk']:
                 chunk_sequence = row[chunk]
-                percent_id = run_local_blast(chunk_sequence, database_cmd)
+                        
+                alignment_length, percent_id, percent_qmatch = run_blastn(chunk_sequence, database_cmd)
                 df.at[index, chunk.replace('chunk', 'percent_id')] = percent_id
+                df.at[index, chunk.replace('chunk', 'percent_qmatch')] = percent_qmatch
+                df.at[index, chunk.replace('chunk', 'alignment_length')] = alignment_length
 
-            # Convert percent_id columns to numeric
-        for col in ['start_percent_id', 'mid_percent_id', 'end_percent_id']:
+        # Convert percent_id columns to numeric
+        for col in ['start_percent_id', 'mid_percent_id', 'end_percent_id', 'start_percent_qmatch', 'mid_percent_qmatch', 'end_percent_qmatch', 'start_alignment_length', 'mid_alignment_length', 'end_alignment_length']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
 
-        # Filter the DataFrame to remove rows with a percent_id greater than 80
-        filtered_df = df[(df['start_percent_id'] <= 80.000) & (df['mid_percent_id'] <= 80.000) & (df['end_percent_id'] <= 80.000)]
+        # Filter the DataFrame to remove rows with a percent_id greater than 80 and percent_qmatch greater than 50
+        filtered_df = df[~((df['start_percent_id'] > 80.000) & (df['start_percent_qmatch'] > 50.000) |
+                            (df['mid_percent_id'] > 80.000) & (df['mid_percent_qmatch'] > 50.000) |
+                            (df['end_percent_id'] > 80.000) & (df['end_percent_qmatch'] > 50.000) |
+                            ((df['start_percent_id'] == 100.000) & (df['start_alignment_length'] > 100)) |
+                            ((df['mid_percent_id'] == 100.000) & (df['mid_alignment_length'] > 100)) |
+                            ((df['end_percent_id'] == 100.000) & (df['end_alignment_length'] > 100)))]
+    
         removed_df = df[~df.index.isin(filtered_df.index)]
-
+    
         # Save the removed rows as a separate CSV file
         os.chdir(MIXED_GENOME_DIRECTORY)
         removed_df.to_csv(INPUT_FASTA.replace('.fasta', csv_suffix), index=False)
-
+    
         # Update the DataFrame to only include the filtered rows
         df = filtered_df
 
